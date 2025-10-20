@@ -14,3 +14,6 @@
 **/*.egg-info/**
 logs
 dataset/tolerance
+*.png
+*.pt
+*.jpg
