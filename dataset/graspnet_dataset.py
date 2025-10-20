@@ -9,9 +9,14 @@ import scipy.io as scio
 from PIL import Image
 
 import torch
-from torch._six import container_abcs
 from torch.utils.data import Dataset
 from tqdm import tqdm
+
+# fixed torch version error
+try:
+    from torch._six import container_abcs
+except ImportError:
+    import collections.abc as container_abcs
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
