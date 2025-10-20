@@ -4,7 +4,7 @@ It will detect the object using YOLO-World and then use SAM to segment the objec
 It will save the segmentation mask to a file.
 
 bash command:
-python cv_process.py captures/20251020_143527_956
+python cv_process.py captures/20251020_143527_956  
 '''
 
 import cv2
@@ -24,7 +24,7 @@ def choose_model():
         model=model_weight,
         conf=0.25,
         save=False,
-        device='cpu'  # 使用CPU避免GPU内存不足
+        device='cpu'  # use CPU to avoid GPU memory shortage
     )
     return SAMPredictor(overrides=overrides)
 
@@ -100,25 +100,25 @@ def segment_image(image_path, output_mask='mask1.png'):
 
     if detections:
         # Show all detections and let user choose
-        print(f"\n检测到的物体:")
+        print(f"\detected objects:")
         for i, det in enumerate(detections):
-            print(f"{i+1}. {det['cls']} (置信度: {det['conf']:.2f})")
+            print(f"{i+1}. {det['cls']} (confidence: {det['conf']:.2f})")
         
         if len(detections) > 1:
             try:
-                choice = int(input(f"请选择要分割的物体 (1-{len(detections)}): ")) - 1
+                choice = int(input(f"select the object to segment (1-{len(detections)}): ")) - 1
                 if 0 <= choice < len(detections):
                     selected_det = detections[choice]
                 else:
-                    selected_det = detections[0]  # 默认选择第一个
+                    selected_det = detections[0]  # default select the first one
             except:
-                selected_det = detections[0]  # 默认选择第一个
+                selected_det = detections[0]  # default select the first one
         else:
             selected_det = detections[0]
         
         results = predictor(bboxes=[selected_det["xyxy"]])
         center, mask = process_sam_results(results)
-        print(f"选择了 {selected_det['cls']} (置信度: {selected_det['conf']:.2f})")
+        print(f"selected {selected_det['cls']} (confidence: {selected_det['conf']:.2f})")
     else:
         # Manual point selection
         print("No detections - click on target object")
