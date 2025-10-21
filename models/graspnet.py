@@ -64,7 +64,9 @@ class GraspNet(nn.Module):
     def __init__(self, input_feature_dim=0, num_view=300, num_angle=12, num_depth=4, cylinder_radius=0.05, hmin=-0.02, hmax_list=[0.01,0.02,0.03,0.04], is_training=True):
         super().__init__()
         self.is_training = is_training
+        # stage 1: grasp point and viewpoint estimator
         self.view_estimator = GraspNetStage1(input_feature_dim, num_view)
+        # stage 2: grasp configuration estimator
         self.grasp_generator = GraspNetStage2(num_angle, num_depth, cylinder_radius, hmin, hmax_list, is_training)
 
     def forward(self, end_points):
