@@ -26,7 +26,7 @@ class Pointnet2Backbone(nn.Module):
     """
     def __init__(self, input_feature_dim=0):
         super().__init__()
-
+        # 4 layers of Set Abstraction (SA) modules
         self.sa1 = PointnetSAModuleVotes(
                 npoint=2048,
                 radius=0.04,
@@ -62,7 +62,7 @@ class Pointnet2Backbone(nn.Module):
                 use_xyz=True,
                 normalize_xyz=True
             )
-
+        # 2 layers of Feature Propagation (FP) modules
         self.fp1 = PointnetFPModule(mlp=[256+256,256,256])
         self.fp2 = PointnetFPModule(mlp=[256+256,256,256])
 
