@@ -14,3 +14,5 @@
 **/*.egg-info/**
 logs
 dataset/tolerance
+*.mp4
+graspnet_training_datasets

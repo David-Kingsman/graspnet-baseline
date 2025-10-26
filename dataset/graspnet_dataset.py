@@ -9,8 +9,8 @@ import scipy.io as scio
 from PIL import Image
 
 import torch
-from torch._six import container_abcs
 from torch.utils.data import Dataset
+import collections.abc as container_abcs
 from tqdm import tqdm
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -55,10 +55,10 @@ class GraspNetDataset(Dataset):
         self.frameid = []
         for x in tqdm(self.sceneIds, desc = 'Loading data path and collision labels...'):
             for img_num in range(256):
-                self.colorpath.append(os.path.join(root, 'scenes', x, camera, 'rgb', str(img_num).zfill(4)+'.png'))
-                self.depthpath.append(os.path.join(root, 'scenes', x, camera, 'depth', str(img_num).zfill(4)+'.png'))
-                self.labelpath.append(os.path.join(root, 'scenes', x, camera, 'label', str(img_num).zfill(4)+'.png'))
-                self.metapath.append(os.path.join(root, 'scenes', x, camera, 'meta', str(img_num).zfill(4)+'.mat'))
+                self.colorpath.append(os.path.join(root, x, camera, 'rgb', str(img_num).zfill(4)+'.png'))
+                self.depthpath.append(os.path.join(root, x, camera, 'depth', str(img_num).zfill(4)+'.png'))
+                self.labelpath.append(os.path.join(root, x, camera, 'label', str(img_num).zfill(4)+'.png'))
+                self.metapath.append(os.path.join(root, x, camera, 'meta', str(img_num).zfill(4)+'.mat'))
                 self.scenename.append(x.strip())
                 self.frameid.append(img_num)
             if self.load_label:
@@ -122,8 +122,8 @@ class GraspNetDataset(Dataset):
         depth_mask = (depth > 0)
         seg_mask = (seg > 0)
         if self.remove_outlier:
-            camera_poses = np.load(os.path.join(self.root, 'scenes', scene, self.camera, 'camera_poses.npy'))
-            align_mat = np.load(os.path.join(self.root, 'scenes', scene, self.camera, 'cam0_wrt_table.npy'))
+            camera_poses = np.load(os.path.join(self.root, scene, self.camera, 'camera_poses.npy'))
+            align_mat = np.load(os.path.join(self.root, scene, self.camera, 'cam0_wrt_table.npy'))
             trans = np.dot(align_mat, camera_poses[self.frameid[index]])
             workspace_mask = get_workspace_mask(cloud, seg, trans=trans, organized=True, outlier=0.02)
             mask = (depth_mask & workspace_mask)
@@ -174,8 +174,8 @@ class GraspNetDataset(Dataset):
         depth_mask = (depth > 0)
         seg_mask = (seg > 0)
         if self.remove_outlier:
-            camera_poses = np.load(os.path.join(self.root, 'scenes', scene, self.camera, 'camera_poses.npy'))
-            align_mat = np.load(os.path.join(self.root, 'scenes', scene, self.camera, 'cam0_wrt_table.npy'))
+            camera_poses = np.load(os.path.join(self.root, scene, self.camera, 'camera_poses.npy'))
+            align_mat = np.load(os.path.join(self.root, scene, self.camera, 'cam0_wrt_table.npy'))
             trans = np.dot(align_mat, camera_poses[self.frameid[index]])
             workspace_mask = get_workspace_mask(cloud, seg, trans=trans, organized=True, outlier=0.02)
             mask = (depth_mask & workspace_mask)
