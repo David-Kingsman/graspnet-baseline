@@ -27,46 +27,61 @@ class Pointnet2Backbone(nn.Module):
     def __init__(self, input_feature_dim=0):
         super().__init__()
         # 4 layers of Set Abstraction (SA) modules
+        # sa1: 2048 points, 4cm radius, 64 samples
         self.sa1 = PointnetSAModuleVotes(
-                npoint=2048,
-                radius=0.04,
-                nsample=64,
-                mlp=[input_feature_dim, 64, 64, 128],
-                use_xyz=True,
-                normalize_xyz=True
+                npoint=2048,    # number of points in the output feature
+                radius=0.04,    # radius of the ball query, 4cm
+                nsample=64,     # number of samples in the ball query
+                mlp=[input_feature_dim, 64, 64, 128], # input feature dimension, 64, 64, 128
+                use_xyz=True, # use xyz coordinates
+                normalize_xyz=True # normalize xyz coordinates
             )
 
+        # sa2: 1024 points, 10cm radius, 32 samples
         self.sa2 = PointnetSAModuleVotes(
-                npoint=1024,
-                radius=0.1,
-                nsample=32,
-                mlp=[128, 128, 128, 256],
-                use_xyz=True,
-                normalize_xyz=True
+                npoint=1024, # number of points in the output feature
+                radius=0.1,    # radius of the ball query, 10cm
+                nsample=32,     # number of samples in the ball query
+                mlp=[128, 128, 128, 256], # input feature dimension, 128, 128, 256
+                use_xyz=True, # use xyz coordinates
+                normalize_xyz=True # normalize xyz coordinates
             )
 
+        # sa3: 512 points, 20cm radius, 16 samples
         self.sa3 = PointnetSAModuleVotes(
-                npoint=512,
-                radius=0.2,
-                nsample=16,
-                mlp=[256, 128, 128, 256],
-                use_xyz=True,
-                normalize_xyz=True
+                npoint=512,  # number of points in the output feature
+                radius=0.2,    # radius of the ball query, 20cm
+                nsample=16,     # number of samples in the ball query
+                mlp=[256, 128, 128, 256], # input feature dimension, 256, 128, 128, 256
+                use_xyz=True, # use xyz coordinates
+                normalize_xyz=True # normalize xyz coordinates
             )
 
+        # sa4: 256 points, 30cm radius, 16 samples
         self.sa4 = PointnetSAModuleVotes(
-                npoint=256,
-                radius=0.3,
-                nsample=16,
-                mlp=[256, 128, 128, 256],
-                use_xyz=True,
-                normalize_xyz=True
+                npoint=256,  # number of points in the output feature
+                radius=0.3,    # radius of the ball query, 30cm
+                nsample=16,     # number of samples in the ball query
+                mlp=[256, 128, 128, 256], # input feature dimension, 256, 128, 128, 256
+                use_xyz=True, # use xyz coordinates
+                normalize_xyz=True # normalize xyz coordinates
             )
-        # 2 layers of Feature Propagation (FP) modules
+        # 2 layers of Feature Propagation (FP) modules to upsample the features
         self.fp1 = PointnetFPModule(mlp=[256+256,256,256])
         self.fp2 = PointnetFPModule(mlp=[256+256,256,256])
 
     def _break_up_pc(self, pc):
+        '''
+        Break up the point cloud into xyz and features
+        Parameters
+        ----------
+        pc: torch.Tensor
+            (B, N, 3 + input_feature_dim) tensor
+            Point cloud to break up
+            Each point in the point-cloud MUST
+            be formated as (x, y, z, features...)
+        Returns
+        '''
         xyz = pc[..., 0:3].contiguous()
         features = (
             pc[..., 3:].transpose(1, 2).contiguous()

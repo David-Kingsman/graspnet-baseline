@@ -25,9 +25,8 @@ from label_generation import process_grasp_labels, match_grasp_view_and_label, b
 class GraspNetStage1(nn.Module):
     def __init__(self, input_feature_dim=0, num_view=300):
         super().__init__()
-        self.backbone = Pointnet2Backbone(input_feature_dim)
-        self.vpmodule = ApproachNet(num_view, 256)
-
+        self.backbone = Pointnet2Backbone(input_feature_dim)  # backbone network for feature learning -- pointnet2
+        self.vpmodule = ApproachNet(num_view, 256)  # module for viewpoint estimation -- pointnet++
     def forward(self, end_points):
         pointcloud = end_points['point_clouds']
         seed_features, seed_xyz, end_points = self.backbone(pointcloud, end_points)
@@ -41,9 +40,10 @@ class GraspNetStage2(nn.Module):
         self.num_angle = num_angle
         self.num_depth = num_depth
         self.is_training = is_training
-        self.crop = CloudCrop(64, 3, cylinder_radius, hmin, hmax_list)
-        self.operation = OperationNet(num_angle, num_depth)
-        self.tolerance = ToleranceNet(num_angle, num_depth)
+        # 3 modules for grasp configuration estimation, including: CloudCrop、OperationNet and ToleranceNet.
+        self.crop = CloudCrop(64, 3, cylinder_radius, hmin, hmax_list)  # used to extract local region features from point cloud
+        self.operation = OperationNet(num_angle, num_depth) # used to estimate the grasp operation parameters, including the grasp angle and depth
+        self.tolerance = ToleranceNet(num_angle, num_depth) # used to estimate the tolerance of the grasp
     
     def forward(self, end_points):
         pointcloud = end_points['input_xyz']
@@ -64,16 +64,16 @@ class GraspNet(nn.Module):
     def __init__(self, input_feature_dim=0, num_view=300, num_angle=12, num_depth=4, cylinder_radius=0.05, hmin=-0.02, hmax_list=[0.01,0.02,0.03,0.04], is_training=True):
         super().__init__()
         self.is_training = is_training
-        # stage 1: grasp point and viewpoint estimator
+        # stage 1: grasp point and viewpoint estimator 
         self.view_estimator = GraspNetStage1(input_feature_dim, num_view)
-        # stage 2: grasp configuration estimator
+        # stage 2: grasp configuration estimator, used for grasp pose generation
         self.grasp_generator = GraspNetStage2(num_angle, num_depth, cylinder_radius, hmin, hmax_list, is_training)
 
     def forward(self, end_points):
-        end_points = self.view_estimator(end_points)
+        end_points = self.view_estimator(end_points) # stage 1: grasp point and viewpoint estimator 
         if self.is_training:
-            end_points = process_grasp_labels(end_points)
-        end_points = self.grasp_generator(end_points)
+            end_points = process_grasp_labels(end_points) # process the grasp labels
+        end_points = self.grasp_generator(end_points) # stage 2: grasp configuration estimator, used for grasp pose generation
         return end_points
 
 def pred_decode(end_points):
