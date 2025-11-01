@@ -1,3 +1,6 @@
+'''
+This script is used to fit a cylinder to a point cloud.
+'''
 import open3d as o3d
 import numpy as np
 import cv2
@@ -7,25 +10,25 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA # principal component analysis
 import time
 
-# --- camera intrinsic parameters
+# -----------------------------camera intrinsic parameters------------------------------
 fx = 1734.7572357650336
 fy = 1734.593101527403
 cx = 632.2360387060742
 cy = 504.996466076361
 
-# --- image path
-depth_path = r'image\90\v_p1_90_400_80_depth_image.tiff'
-rgb_path = r'image\90\v_p1_90_400_80_depth_filtered_image.jpg'
+# -----------------------------depth and rgb image path------------------------------
+depth_path = r'/home/zekaijin/graspnet-baseline/rebar_tying/texture_suppression_model/images/rebar_joint_pose_estimation/Nano0711/Vertical/v_p1_45_400_0_depth_image.tiff'
+rgb_path = r'/home/zekaijin/graspnet-baseline/rebar_tying/texture_suppression_model/images/rebar_joint_pose_estimation/Nano0711/Vertical/v_p1_45_400_0_depth_filtered_image.jpg'
 
 # depth_path = r'image\i_p1_69_400_0_depth_image.tiff'
 # rgb_path = r'image\i_p1_69_400_0_depth_filtered_image.jpg'
 
-# --- read image
+# -----------------------------read image------------------------------
 depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0
 rgb_raw = cv2.cvtColor(cv2.imread(rgb_path), cv2.COLOR_BGR2RGB)
 rgb_display = rgb_raw.copy()
 
-# --- mouse click to select point
+# -----------------------------mouse click to select point------------------------------
 clicked_point = []
 def mouse_callback(event, x, y, flags, param):
     '''mouse callback function'''
@@ -42,7 +45,7 @@ if not clicked_point:
     print("No point clicked, exit.")
     exit()
 
-# --- generate local point cloud
+# -----------------------------generate local point cloud------------------------------
 x, y = clicked_point[0]
 h, w = depth_raw.shape
 half_win = 100
@@ -61,13 +64,13 @@ valid = (z > 0) & (z < 0.5)
 xyz = np.stack((x3d[valid], y3d[valid], z[valid]), axis=-1)
 colors = rgb_crop.reshape(-1, 3)[valid.flatten()] / 255.0
 
-# --- build point cloud
+# -----------------------------build point cloud------------------------------
 pcd = o3d.geometry.PointCloud()
 pcd.points = o3d.utility.Vector3dVector(xyz)
 pcd.colors = o3d.utility.Vector3dVector(colors)
 o3d.visualization.draw_geometries([pcd], window_name="point cloud display")
 
-# --- denoising: remove statistical outliers
+# -----------------------------denoising: remove statistical outliers------------------------------
 pcd_clean, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
 print(f"Original points: {len(pcd.points)}, After denoising: {len(pcd_clean.points)}")
 
@@ -77,7 +80,7 @@ if len(pcd_clean.points) == 0:
 
 points = np.asarray(pcd_clean.points)
 
-# --- point cloud downsampling function
+# -----------------------------point cloud downsampling function------------------------------
 def downsample_points(points_np, voxel_size=0.005):
     pcd_tmp = o3d.geometry.PointCloud()
     pcd_tmp.points = o3d.utility.Vector3dVector(points_np)
@@ -86,7 +89,8 @@ def downsample_points(points_np, voxel_size=0.005):
 
 time1 = time.time()
 
-# --- DBSCAN clustering
+# -----------------------------DBSCAN clustering------------------------------
+print("DBSCAN clustering...")
 points_scaled = StandardScaler().fit_transform(points)
 db = DBSCAN(eps=0.3, min_samples=30).fit(points_scaled)
 labels = db.labels_
@@ -100,7 +104,7 @@ pcd_clustered.points = o3d.utility.Vector3dVector(points)
 pcd_clustered.colors = o3d.utility.Vector3dVector(colors_dbscan)
 o3d.visualization.draw_geometries([pcd_clustered], window_name="Clustered PointCloud")
 
-# --- extract the top three largest clusters
+# -----------------------------extract the top three largest clusters------------------------------
 import collections
 label_counts = collections.Counter(labels[labels != -1])
 top3_labels = [label for label, _ in label_counts.most_common(3)]
@@ -109,15 +113,15 @@ pts_class_1 = points[labels == top3_labels[0]]
 pts_class_2_1 = points[labels == top3_labels[1]]
 pts_class_2_2 = points[labels == top3_labels[2]]
 
-# --- downsampling
+# -----------------------------downsampling------------------------------
 pts_class_1_ds = downsample_points(pts_class_1, voxel_size=0.001)
 pts_class_2_1_ds = downsample_points(pts_class_2_1, voxel_size=0.001)
 pts_class_2_2_ds = downsample_points(pts_class_2_2, voxel_size=0.001)
 
-# --- merge the two钢筋 clusters
+# -----------------------------merge the two rebar clusters------------------------------
 pts_class_2_ds = np.vstack((pts_class_2_1_ds, pts_class_2_2_ds))
 
-# --- cylinder fitting function (least squares)
+# -----------------------------cylinder fitting function (least squares)------------------------------
 def fit_cylinder_least_squares(points):
     pca = PCA(n_components=3)
     pca.fit(points)
@@ -146,6 +150,7 @@ def fit_cylinder_least_squares(points):
 
     return axis_point, axis_dir, radius, h_min, h_max
 
+# -----------------------------create cylinder mesh------------------------------
 def create_cylinder_mesh(axis_point, axis_dir, radius, h_min, h_max, extend_len=0, color=[1, 0, 0]):
     '''create cylinder mesh'''
     # extend height: extend extend_len at both ends
@@ -189,7 +194,7 @@ def create_cylinder_mesh(axis_point, axis_dir, radius, h_min, h_max, extend_len=
 
     return mesh_cyl, axis_line
 
-# --- fit and generate mesh
+# -----------------------------fit and generate mesh------------------------------
 cyl1_point, cyl1_dir, cyl1_radius, cyl1_hmin, cyl1_hmax = fit_cylinder_least_squares(pts_class_1_ds)
 print(cyl1_point, cyl1_dir, cyl1_radius)
 cyl2_point, cyl2_dir, cyl2_radius, cyl2_hmin, cyl2_hmax = fit_cylinder_least_squares(pts_class_2_ds)
@@ -198,7 +203,7 @@ print(cyl2_point, cyl2_dir, cyl2_radius)
 cyl1_mesh, cyl1_axis = create_cylinder_mesh(cyl1_point, cyl1_dir, cyl1_radius, cyl1_hmin, cyl1_hmax, color=[0, 0.75, 1.0])
 cyl2_mesh, cyl2_axis = create_cylinder_mesh(cyl2_point, cyl2_dir, cyl2_radius, cyl2_hmin, cyl2_hmax, color=[0, 0.75, 1.0])
 
-# --- visualize point cloud + fit cylinder
+# -----------------------------visualize point cloud + fit cylinder------------------------------
 pcd_1_vis = o3d.geometry.PointCloud()
 pcd_1_vis.points = o3d.utility.Vector3dVector(pts_class_1_ds)
 pcd_1_vis.paint_uniform_color([1, 0.5, 0])
@@ -226,12 +231,13 @@ pcd_2_2_vis.paint_uniform_color([0.5, 0.5, 0.5])
 # o3d.visualization.draw_geometries([pcd_1_vis, pcd_2_1_vis, pcd_2_2_vis, cyl1_mesh, cyl2_mesh, cyl1_axis, cyl2_axis],
 #                                   window_name="Cylinder Fit Result")
 
-
+# -----------------------------visualize point cloud + fit cylinder------------------------------
 o3d.visualization.draw_geometries([pcd.paint_uniform_color([0.5, 0.5, 0.5]), cyl1_mesh, cyl2_mesh, cyl1_axis, cyl2_axis],
                                   window_name="Cylinder Fit Result")
-import open3d as o3d
-import numpy as np
 
+
+# -----------------------------convert cylinder to point cloud and merge------------------------------
+print("Converting cylinders to point clouds and merging...")
 def mesh_to_pointcloud(mesh, num_points=3000):
     return mesh.sample_points_uniformly(number_of_points=num_points)
 
@@ -292,7 +298,7 @@ o3d.visualization.draw_geometries([
 
 time2 = time.time()
 
-
+# -----------------------------visualize ICP registration after filtering------------------------------
 o3d.visualization.draw_geometries([
     pcd.paint_uniform_color([0.5, 0.5, 0.5]),
     filtered_cyl_pcd_down.paint_uniform_color([0, 0.75, 1.0])

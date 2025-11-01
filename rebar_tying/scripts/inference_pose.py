@@ -12,6 +12,8 @@ python inference_pose.py --model_path /path/to/model.pth --data_dir /path/to/dat
 import os
 import sys
 import numpy as np
+import math
+import csv
 import torch
 import torch.nn as nn
 import argparse
@@ -27,6 +29,11 @@ sys.path.append(os.path.join(ROOT_DIR, 'models'))
 
 from backbone import Pointnet2Backbone
 
+try:
+    import open3d as o3d
+except Exception:
+    o3d = None
+
 
 class PoseEstimationNet(nn.Module):
     """
@@ -40,23 +47,25 @@ class PoseEstimationNet(nn.Module):
         # use GraspNet backbone
         self.backbone = Pointnet2Backbone(input_feature_dim)
         
-        # separate prediction heads
-        # translation prediction head (3D)
-        self.translation_head = nn.Sequential(
-            nn.Linear(256 * 2, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 3)
+        # pose regression head
+        # backbone output (B, 1024, num_seed) features
+        # we need to pool to get global features
+        self.global_pool = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.AdaptiveMaxPool1d(1)
         )
         
-        # rotation prediction head (6D -> 3x3 matrix)
-        self.rotation_head = nn.Sequential(
-            nn.Linear(256 * 2, 512),
+        # pose prediction head with LazyLinear to adapt 2*C channels
+        self.pose_head = nn.Sequential(
+            nn.LazyLinear(512),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(256, 6)  # 6 parameters for building rotation matrix
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 16)
         )
     
     def forward(self, x, end_points=None):
@@ -67,56 +76,24 @@ class PoseEstimationNet(nn.Module):
         Returns:
             pose: (B, 4, 4) pose matrix
         """
+        # 注意：本工程backbone期望输入(B, N, 3)，无需转置
         # extract features through backbone
         seed_features, seed_xyz, end_points = self.backbone(x, end_points)
         
         # global pooling
-        max_feat = torch.max(seed_features, dim=2)[0]  # (B, 256)
-        avg_feat = torch.mean(seed_features, dim=2)    # (B, 256)
-        global_feat = torch.cat([max_feat, avg_feat], dim=1)  # (B, 512)
+        max_feat = torch.amax(seed_features, dim=2)  # (B, C)
+        avg_feat = torch.mean(seed_features, dim=2)  # (B, C)
+        global_feat = torch.cat([max_feat, avg_feat], dim=1)  # (B, 2C)
         
-        # separate prediction heads for translation and rotation
-        translation = self.translation_head(global_feat)  # (B, 3)
-        rotation_params = self.rotation_head(global_feat)  # (B, 6)
+        # pose prediction
+        pose_params = self.pose_head(global_feat)  # (B, 16)
         
-        # build orthogonal rotation matrix from 6 parameters
-        rotation_matrix = self._build_rotation_matrix(rotation_params)  # (B, 3, 3)
-        
-        # build 4x4 pose matrix
+        # reshape to 4x4 pose matrix
         batch_size = x.shape[0]
-        pose = torch.eye(4, device=x.device).unsqueeze(0).repeat(batch_size, 1, 1)
-        pose[:, :3, :3] = rotation_matrix
-        pose[:, :3, 3] = translation
+        pose = pose_params.view(batch_size, 4, 4)  # (B, 4, 4)
         
         return pose
     
-    def _build_rotation_matrix(self, params):
-        """
-        build orthogonal rotation matrix from 6 parameters
-        use Gram-Schmidt orthogonalization process
-        """
-        batch_size = params.shape[0]
-        
-        # reshape 6 parameters to 2 3D vectors
-        v1 = params[:, :3]  # (B, 3)
-        v2 = params[:, 3:]  # (B, 3)
-        
-        # Gram-Schmidt orthogonalization
-        # normalize first vector
-        u1 = v1 / (torch.norm(v1, dim=1, keepdim=True) + 1e-8)
-        
-        # orthogonalize second vector
-        proj = torch.sum(u1 * v2, dim=1, keepdim=True)
-        u2 = v2 - proj * u1
-        u2 = u2 / (torch.norm(u2, dim=1, keepdim=True) + 1e-8)
-        
-        # third vector obtained by cross product
-        u3 = torch.cross(u1, u2, dim=1)
-        
-        # build rotation matrix
-        rotation_matrix = torch.stack([u1, u2, u3], dim=1)  # (B, 3, 3)
-        
-        return rotation_matrix
 
 
 def load_model(model_path, device='cuda'):
@@ -128,8 +105,10 @@ def load_model(model_path, device='cuda'):
     model.eval()
     
     print(f"✅ loaded model: {model_path}")
-    print(f"   best epoch: {checkpoint['epoch']}")
-    print(f"   validation loss: {checkpoint['val_loss']:.6f}")
+    if 'epoch' in checkpoint:
+        print(f"   epoch: {checkpoint['epoch']}")
+    if 'loss' in checkpoint:
+        print(f"   loss: {checkpoint['loss']:.6f}")
     
     return model, checkpoint
 
@@ -177,7 +156,46 @@ def predict_pose(model, pointcloud, device='cuda', max_points=20000):
     return pred_pose
 
 
-def evaluate_on_dataset(model, data_dir, num_samples=10, device='cuda'):
+def project_to_se3(pose4x4: np.ndarray) -> np.ndarray:
+    """Project arbitrary 4x4 to SE(3): R via SVD (orthogonal, det=+1), last row [0,0,0,1]."""
+    T = pose4x4.copy()
+    R0 = T[:3, :3]
+    U, _, Vt = np.linalg.svd(R0)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1
+        R = U @ Vt
+    T[:3, :3] = R
+    T[3, :] = np.array([0, 0, 0, 1], dtype=T.dtype)
+    return T
+
+
+def rotation_error_deg(R_pred: np.ndarray, R_gt: np.ndarray) -> float:
+    """Compute rotation error in degrees using geodesic distance."""
+    R_delta = R_pred @ R_gt.T
+    trace = np.clip((np.trace(R_delta) - 1) / 2.0, -1.0, 1.0)
+    theta = math.acos(trace)
+    return theta * 180.0 / math.pi
+
+
+def draw_axes_o3d(T: np.ndarray, length: float = 0.1):
+    if o3d is None:
+        return []
+    origin = T[:3, 3]
+    Rx = T[:3, 0] * length
+    Ry = T[:3, 1] * length
+    Rz = T[:3, 2] * length
+    points = [origin, origin + Rx, origin, origin + Ry, origin, origin + Rz]
+    lines = [[0, 1], [2, 3], [4, 5]]
+    colors = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(points)
+    ls.lines = o3d.utility.Vector2iVector(lines)
+    ls.colors = o3d.utility.Vector3dVector(colors)
+    return [ls]
+
+
+def evaluate_on_dataset(model, data_dir, num_samples=10, device='cuda', save_csv: str = None, viz: bool = False):
     """
     evaluate model on test data
     
@@ -191,8 +209,13 @@ def evaluate_on_dataset(model, data_dir, num_samples=10, device='cuda'):
     print("start evaluating model")
     print("="*80)
     
-    # load point clouds and ground truth poses
-    scene_folders = sorted(glob.glob(os.path.join(data_dir, 'scene_*')))[:1]  # only use first scene
+    # determine scenes: allow passing either datasets root or a specific scene
+    if os.path.isdir(os.path.join(data_dir, 'pointclouds')):
+        scene_folders = [data_dir]
+    else:
+        scene_folders = sorted(glob.glob(os.path.join(data_dir, 'scene_*')))
+
+    rows = []
     
     for scene_path in scene_folders:
         scene_name = os.path.basename(scene_path)
@@ -222,16 +245,48 @@ def evaluate_on_dataset(model, data_dir, num_samples=10, device='cuda'):
             meta = sio.loadmat(meta_file)
             gt_pose = meta['poses'][obj_idx]
             
-            # predict pose
+            # predict pose and project to SE(3)
             pred_pose = predict_pose(model, pc, device)
+            pred_pose = project_to_se3(pred_pose)
             
             # calculate error
             trans_error = np.linalg.norm(pred_pose[:3, 3] - gt_pose[:3, 3])
-            rot_error = np.linalg.norm(pred_pose[:3, :3] @ gt_pose[:3, :3].T - np.eye(3))
+            rot_error = rotation_error_deg(pred_pose[:3, :3], gt_pose[:3, :3])
             
             print(f"Frame {frame_idx}_obj{obj_idx}:")
-            print(f"   translation error: {trans_error:.6f}m")
-            print(f"   rotation error: {rot_error:.6f}")
+            print(f"   translation error: {trans_error*1000:.2f} mm")
+            print(f"   rotation error: {rot_error:.2f} deg")
+            rows.append([scene_name, frame_idx, obj_idx, trans_error, rot_error])
+
+            # optional visualization
+            if viz and o3d is not None:
+                import numpy as _np
+                import open3d as _o3d
+                pcd = _o3d.geometry.PointCloud()
+                pcd.points = _o3d.utility.Vector3dVector(pc.astype(_np.float64))
+                pcd.paint_uniform_color([0.7, 0.7, 0.7])
+                geoms = [pcd] + draw_axes_o3d(gt_pose, 0.05) + draw_axes_o3d(pred_pose, 0.05)
+                _o3d.visualization.draw_geometries(geoms, window_name=f"{scene_name}:{frame_idx}_obj{obj_idx}")
+
+    # summary
+    if rows:
+        trans_mm = [r[3]*1000.0 for r in rows]
+        rot_deg = [r[4] for r in rows]
+        mean_trans = float(np.mean(trans_mm))
+        median_trans = float(np.median(trans_mm))
+        mean_rot = float(np.mean(rot_deg))
+        median_rot = float(np.median(rot_deg))
+        print("\nSummary (on evaluated samples):")
+        print(f"  Translation error: mean {mean_trans:.2f} mm | median {median_trans:.2f} mm")
+        print(f"  Rotation error:    mean {mean_rot:.2f} deg | median {median_rot:.2f} deg")
+
+        if save_csv:
+            os.makedirs(os.path.dirname(save_csv), exist_ok=True) if os.path.dirname(save_csv) else None
+            with open(save_csv, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['scene', 'frame_idx', 'obj_idx', 'trans_error_m', 'rot_error_deg'])
+                writer.writerows(rows)
+            print(f"  Saved CSV: {save_csv}")
             print()
 
 
@@ -241,6 +296,8 @@ def main():
     parser.add_argument('--pointcloud_path', help='Path to single pointcloud file')
     parser.add_argument('--data_dir', help='Path to dataset for evaluation')
     parser.add_argument('--num_samples', type=int, default=10, help='Number of samples to evaluate')
+    parser.add_argument('--viz', action='store_true', help='Visualize point cloud with GT/Pred axes')
+    parser.add_argument('--save_csv', default=None, help='Path to save evaluation CSV')
     
     args = parser.parse_args()
     
@@ -266,7 +323,7 @@ def main():
     
     # inference mode 2: dataset evaluation
     if args.data_dir:
-        evaluate_on_dataset(model, args.data_dir, args.num_samples, device)
+        evaluate_on_dataset(model, args.data_dir, args.num_samples, device, save_csv=args.save_csv, viz=args.viz)
 
 
 if __name__ == '__main__':
