@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-# Prepare training data in GraspNet format
-    - RGB + Depth images
-    - 6DoF poses
-    - Segmentation masks
-    - Camera intrinsics
+# Prepare training data in GraspNet format: RGB + Depth images + 6DoF poses + Segmentation masks + Camera intrinsics
 
 # bash example for rebar_tying dataset:
 
@@ -12,7 +8,7 @@ python3 rebar_tying/scripts/process_training_data.py \
     --depth_dir rebar_tying/texture_suppression_model/images/rebar_joint_pose_estimation/Nano0711 \
     --output_dir rebar_tying/datasets \
     --yolo_model rebar_tying/texture_suppression_model/runs/pose/train2/weights/best.pt \
-    --conf 0.35 --imgsz 960 --device cuda:0 --min_points 200
+    --conf 0.7 --imgsz 960 --device cuda:0 --min_points 200 --roi_margin 100
     
     Note: 
     - Both RGB and Depth files are searched in depth_dir/Vertical/ or depth_dir/Incline/ subdirectories
@@ -22,7 +18,6 @@ python3 rebar_tying/scripts/process_training_data.py \
     - Incline subdirectory: only matches i_* files
 
 """
-
 import os
 import json
 import numpy as np
@@ -33,7 +28,6 @@ from tqdm import tqdm
 import re
 from sklearn.decomposition import PCA
 from sklearn.cluster import DBSCAN
-from sklearn.preprocessing import StandardScaler
 import collections
 import open3d as o3d
 
@@ -50,20 +44,33 @@ CAMERA_INTRINSICS = np.array([
     [0, 0, 1]
 ])
 
-# --- generate local point cloud
-def depth_to_pointcloud_patch(depth_image, rgb_image, bbox, camera_intrinsics):
+# -----------------------------generate local point cloud------------------------------
+def depth_to_pointcloud_patch(depth_image, rgb_image, bbox, camera_intrinsics, window_size=200):
     """
-    Extract point cloud from depth image within bbox using RGB-D alignment method
-    Reference: cylinder_fitting.py approach (lines 48-64)
+    Extract point cloud from depth image within a fixed-size window centered at bbox center.
+    Similar to cylinder_fitting.py's approach of focusing on a 200x200 window around the keypoint.
+    
+    Args:
+        bbox: bounding box [x1, y1, x2, y2]
+        window_size: size of the square window (default 200x200 like cylinder_fitting.py)
     """
     x1, y1, x2, y2 = [int(coord) for coord in bbox]
     h, w = depth_image.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
+    
+    # Calculate bbox center (keypoint)
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    
+    # Create fixed-size window centered at bbox center (like cylinder_fitting.py's half_win=100)
+    half_win = window_size // 2
+    x_min = max(0, cx - half_win)
+    x_max = min(w, cx + half_win)
+    y_min = max(0, cy - half_win)
+    y_max = min(h, cy + half_win)
     
     # crop depth image
     # note: depth_image should be in millimeters, here convert to meters
-    depth_crop = depth_image[y1:y2, x1:x2].astype(np.float32) / 1000.0
+    depth_crop = depth_image[y_min:y_max, x_min:x_max].astype(np.float32) / 1000.0
     
     # crop RGB image
     if rgb_image is not None:
@@ -73,9 +80,9 @@ def depth_to_pointcloud_patch(depth_image, rgb_image, bbox, camera_intrinsics):
             rgb_resized = cv2.resize(rgb_image, (w, h), interpolation=cv2.INTER_LINEAR)
             # convert to RGB format
             rgb_resized = cv2.cvtColor(rgb_resized, cv2.COLOR_BGR2RGB)
-            rgb_crop = rgb_resized[y1:y2, x1:x2]
+            rgb_crop = rgb_resized[y_min:y_max, x_min:x_max]
         else:
-            rgb_crop = cv2.cvtColor(rgb_image[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+            rgb_crop = cv2.cvtColor(rgb_image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2RGB)
     else:
         rgb_crop = None
     
@@ -85,8 +92,8 @@ def depth_to_pointcloud_patch(depth_image, rgb_image, bbox, camera_intrinsics):
     fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
     cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
     
-    # use meshgrid to generate pixel coordinates
-    xx, yy = np.meshgrid(np.arange(x1, x2), np.arange(y1, y2))
+    # use meshgrid to generate pixel coordinates (use the window coordinates)
+    xx, yy = np.meshgrid(np.arange(x_min, x_max), np.arange(y_min, y_max))
     
     # z is already in meters, directly use
     z = depth_crop
@@ -104,7 +111,7 @@ def depth_to_pointcloud_patch(depth_image, rgb_image, bbox, camera_intrinsics):
     
     return xyz
 
-# --- point cloud downsampling function
+# -----------------------------point cloud downsampling function------------------------------
 def downsample_points(points_np, voxel_size=0.005):
     """Downsample point cloud using voxel grid"""
     pcd_tmp = o3d.geometry.PointCloud()
@@ -112,7 +119,7 @@ def downsample_points(points_np, voxel_size=0.005):
     pcd_down = pcd_tmp.voxel_down_sample(voxel_size=voxel_size)
     return np.asarray(pcd_down.points)
 
-# --- cylinder fitting function (least squares)
+# -----------------------------cylinder fitting function (least squares)------------------------------
 def fit_cylinder_least_squares(points):
     """Fit cylinder using least squares method"""
     if len(points) < 10:
@@ -121,8 +128,6 @@ def fit_cylinder_least_squares(points):
     pca = PCA(n_components=3)
     pca.fit(points)
     axis_dir = pca.components_[0]
-    if axis_dir[2] < 0:
-        axis_dir = -axis_dir
 
     projections = points @ axis_dir
     h_min, h_max = projections.min(), projections.max()
@@ -137,16 +142,59 @@ def fit_cylinder_least_squares(points):
     A = np.column_stack((2*u, 2*v, np.ones_like(u)))
     b = u**2 + v**2
 
-    try:
-        x = np.linalg.lstsq(A, b, rcond=None)[0]
-        u0, v0, c = x
-        radius = np.sqrt(c + u0**2 + v0**2)
-        axis_point = u0 * plane_x + v0 * plane_y + axis_dir * h_min
-        return axis_point, axis_dir, radius, h_min, h_max
-    except:
-        return None
+    x = np.linalg.lstsq(A, b, rcond=None)[0]
+    u0, v0, c = x
+    radius = np.sqrt(c + u0**2 + v0**2)
 
-# --- calculate line intersection
+    axis_point = u0 * plane_x + v0 * plane_y + axis_dir * h_min
+
+    return axis_point, axis_dir, radius, h_min, h_max
+
+# -----------------------------canonicalize coordinate system------------------------------
+def canonicalize_axes_opencv(z_axis, x_hint, ref_z=np.array([0.,0.,1.], dtype=np.float32)):
+    """
+    Canonicalize local coordinate system to OpenCV camera frame:
+      1) z aligns with ref_z (camera +Z)
+      2) x is the orthogonal projection of x_hint onto z's plane
+      3) Right-handed system, with y=z×x also aligned with ref_z
+    Input:
+      z_axis: main axis direction (e.g. cyl1_dir)
+      x_hint: secondary axis direction (e.g. cyl2_dir)
+    Returns:
+      R: 3x3 rotation matrix (column vectors are x,y,z)
+    """
+    z = z_axis.astype(np.float32)
+    z /= (np.linalg.norm(z) + 1e-9)
+
+    # (1) Force z to align with ref_z
+    if float(np.dot(z, ref_z)) < 0.0:
+        z = -z
+
+    # (2) Use x_hint to construct x on z's orthogonal plane
+    xh = x_hint.astype(np.float32)
+    xh /= (np.linalg.norm(xh) + 1e-9)
+    x = xh - float(np.dot(xh, z)) * z
+    if np.linalg.norm(x) < 1e-9:  # Degenerate case: x_hint parallel to z, pick arbitrary orthogonal axis
+        x = np.array([1.,0.,0.], dtype=np.float32) - float(np.dot([1.,0.,0.], z)) * z
+    x /= (np.linalg.norm(x) + 1e-9)
+
+    # (3) Right-handed coordinate system
+    y = np.cross(z, x)
+    y /= (np.linalg.norm(y) + 1e-9)
+
+    # Optional: ensure y aligns with ref_z (unique orientation)
+    if float(np.dot(y, ref_z)) < 0.0:
+        x = -x
+        y = -y
+
+    R = np.stack([x, y, z], axis=1)  # columns are x,y,z
+    # Numerical robustness: ensure det>0
+    if np.linalg.det(R) < 0:
+        x = -x
+        R = np.stack([x, y, z], axis=1)
+    return R
+
+# -----------------------------calculate line intersection------------------------------
 def calculate_line_intersection(line1_point, line1_dir, line2_point, line2_dir):
     """Calculate intersection point of two lines in 3D"""
     # Line 1: P1 + t1 * D1
@@ -189,9 +237,17 @@ def calculate_line_intersection(line1_point, line1_dir, line2_point, line2_dir):
     intersection = (point1 + point2) / 2
     return intersection
 
-# --- estimate pose from point cloud
-def estimate_pose_from_pointcloud(pointcloud):
-    """Estimate 6DoF pose from point cloud using cylinder fitting"""
+# -----------------------------estimate pose from point cloud------------------------------
+def estimate_pose_from_pointcloud(pointcloud, stats=None):
+    """
+    Estimate 6DoF pose from point cloud using cylinder fitting.
+    
+    This implementation follows the same clustering strategy:
+    - Uses DBSCAN with min_samples=30 to detect clusters
+    - Extracts top 3 clusters
+    - Merges 2nd and 3rd largest clusters to represent one rebar
+    - Fits cylinders to find intersection point and orientation
+    """
     if len(pointcloud) < 50:
         return np.eye(4)
     
@@ -207,31 +263,74 @@ def estimate_pose_from_pointcloud(pointcloud):
         
         points = np.asarray(pcd_clean.points)
         
-        # 3. DBSCAN clustering
-        points_scaled = StandardScaler().fit_transform(points)
-        db = DBSCAN(eps=0.3, min_samples=20).fit(points_scaled)
+        # 3. Limit points for DBSCAN to speed up clustering
+        MAX_PTS = 5000
+        if len(points) > MAX_PTS:
+            rng = np.random.default_rng()
+            sel = rng.choice(len(points), size=MAX_PTS, replace=False)
+            points = points[sel]
+        
+        # Lightweight whitening (faster than StandardScaler)
+        mean = points.mean(axis=0, keepdims=True)
+        std = points.std(axis=0, keepdims=True) + 1e-9
+        points_scaled = (points - mean) / std
+        
+        # DBSCAN with parallel processing
+        db = DBSCAN(eps=0.3, min_samples=30, n_jobs=-1).fit(points_scaled)
         labels = db.labels_
         
-        # 4. extract the main clusters
-        unique_labels = set(labels)
-        if len(unique_labels) < 2:  # at least 2 clusters are needed
+        # 4. extract the main clusters (top 3, then merge 2nd and 3rd)
+        valid_labels = labels[labels != -1]
+        unique_labels = set(valid_labels)
+        if len(unique_labels) < 3:  # need at least 3 clusters for merging
+            # fallback: try with top 2 clusters if only 2 available
+            if stats is not None:
+                if len(unique_labels) >= 2:
+                    stats['top2_fallback'] += 1
+                else:
+                    stats['cluster_too_few'] += 1
+            if len(unique_labels) >= 2:
+                top2_labels = [label for label, _ in collections.Counter(labels[labels != -1]).most_common(2)]
+                if len(top2_labels) == 2:
+                    cyl1_points = points[labels == top2_labels[0]]
+                    cyl2_points = points[labels == top2_labels[1]]
+                    if len(cyl1_points) >= 10 and len(cyl2_points) >= 10:
+                        cyl1_points_ds = downsample_points(cyl1_points, voxel_size=0.001)
+                        cyl2_points_ds = downsample_points(cyl2_points, voxel_size=0.001)
+                        if len(cyl1_points_ds) >= 5 and len(cyl2_points_ds) >= 5:
+                            cyl1_params = fit_cylinder_least_squares(cyl1_points_ds)
+                            cyl2_params = fit_cylinder_least_squares(cyl2_points_ds)
+                            if cyl1_params is not None and cyl2_params is not None:
+                                cyl1_point, cyl1_dir, cyl1_radius, cyl1_hmin, cyl1_hmax = cyl1_params
+                                cyl2_point, cyl2_dir, cyl2_radius, cyl2_hmin, cyl2_hmax = cyl2_params
+                                intersection_point = calculate_line_intersection(
+                                    cyl1_point, cyl1_dir, cyl2_point, cyl2_dir
+                                )
+                                # Canonicalize coordinate system: z aligns with camera +Z
+                                R = canonicalize_axes_opencv(z_axis=cyl1_dir, x_hint=cyl2_dir)
+                                pose_matrix = np.eye(4, dtype=np.float32)
+                                pose_matrix[:3, :3] = R
+                                pose_matrix[:3, 3] = intersection_point.astype(np.float32)
+                                return pose_matrix
             return np.eye(4)
         
         label_counts = collections.Counter(labels[labels != -1])
-        top2_labels = [label for label, _ in label_counts.most_common(2)]
+        top3_labels = [label for label, _ in label_counts.most_common(3)]
         
-        if len(top2_labels) < 2:
+        if len(top3_labels) < 3:
             return np.eye(4)
         
-        cyl1_points = points[labels == top2_labels[0]]
-        cyl2_points = points[labels == top2_labels[1]]
+        cyl1_points = points[labels == top3_labels[0]]  # main cluster
+        cyl2_points_1 = points[labels == top3_labels[1]]  # 2nd cluster
+        cyl2_points_2 = points[labels == top3_labels[2]]  # 3rd cluster
         
-        if len(cyl1_points) < 10 or len(cyl2_points) < 10:
-            return np.eye(4)
-        
-        # 5. downsampling
+        # 5. downsampling (downsample each cluster BEFORE merging)
         cyl1_points_ds = downsample_points(cyl1_points, voxel_size=0.001)
-        cyl2_points_ds = downsample_points(cyl2_points, voxel_size=0.001)
+        cyl2_points_1_ds = downsample_points(cyl2_points_1, voxel_size=0.001)
+        cyl2_points_2_ds = downsample_points(cyl2_points_2, voxel_size=0.001)
+        
+        # merge 2nd and 3rd clusters
+        cyl2_points_ds = np.vstack((cyl2_points_1_ds, cyl2_points_2_ds))
         
         if len(cyl1_points_ds) < 5 or len(cyl2_points_ds) < 5:
             return np.eye(4)
@@ -251,27 +350,15 @@ def estimate_pose_from_pointcloud(pointcloud):
             cyl1_point, cyl1_dir, cyl2_point, cyl2_dir
         )
         
-        # 8. build the local coordinate system of the intersection point
-        # the main rebar direction as the Z axis
-        z_axis = cyl1_dir / np.linalg.norm(cyl1_dir)
+        # 8. canonicalize coordinate system: z aligns with camera +Z
+        R = canonicalize_axes_opencv(z_axis=cyl1_dir, x_hint=cyl2_dir)
+        pose_matrix = np.eye(4, dtype=np.float32)
+        pose_matrix[:3, :3] = R
+        pose_matrix[:3, 3] = intersection_point.astype(np.float32)
         
-        # the cross rebar direction as the X axis
-        x_axis = cyl2_dir / np.linalg.norm(cyl2_dir)
-        
-        # ensure orthogonality
-        x_axis = x_axis - np.dot(x_axis, z_axis) * z_axis
-        x_axis = x_axis / np.linalg.norm(x_axis)
-        
-        # Y axis = Z axis × X axis
-        y_axis = np.cross(z_axis, x_axis)
-        y_axis = y_axis / np.linalg.norm(y_axis)
-        
-        # 9. build 4x4 transformation matrix
-        pose_matrix = np.eye(4)
-        pose_matrix[:3, 0] = x_axis
-        pose_matrix[:3, 1] = y_axis
-        pose_matrix[:3, 2] = z_axis
-        pose_matrix[:3, 3] = intersection_point
+        # Mark successful top3 clustering
+        if stats is not None:
+            stats['top3_success'] += 1
         
         return pose_matrix
         
@@ -283,10 +370,14 @@ def estimate_pose_from_pointcloud(pointcloud):
         pose[:3, 3] = center
         return pose
 
-# --- prepare scene data
-def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=640, device=None, min_points=100):
+# -----------------------------prepare scene data------------------------------
+def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=640, device=None, min_points=100, roi_margin=50):
     """
     Prepare data in GraspNet scene format
+    
+    Args:
+        roi_margin: pixel margin from image borders to exclude from ROI (default 50)
+                    Only bbox centers within ROI are kept (ignores edge detections)
     """
     print("="*80)
     print("Preparing GraspNet-style Training Data")
@@ -341,13 +432,27 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
     # Group by scene (by subdirectory: Vertical or Incline)
     scenes = {}
     
+    # Debug counters
+    stats = {
+        'total_frames': 0,
+        'no_detections': 0,
+        'detections_filtered': 0,
+        'fitting_failed': 0,
+        'success_frames': 0,
+        'low_points': 0,
+        'identity_pose': 0,
+        'cluster_too_few': 0,
+        'top2_fallback': 0,
+        'top3_success': 0
+    }
+    
     for idx, (subdir, rgb_file) in enumerate(tqdm(rgb_files, desc="Processing")):
-        # 按照子目录（Vertical/Incline）分组场景
+        # group by scene (by subdirectory: Vertical or Incline)
         if subdir:
-            # 使用子目录名作为场景名（转换为小写）
+            # use subdirectory name as scene name (convert to lowercase)
             scene_key = f"scene_{subdir.lower()}"
         else:
-            # 如果没有子目录，使用默认名称
+            # if no subdirectory, use default name
             scene_key = "scene_default"
         
         if scene_key not in scenes:
@@ -364,6 +469,7 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
         frame_idx = scenes[scene_key]['frames']
         
         try:
+            stats['total_frames'] += 1
             # extract information from RGB file name and find corresponding depth file
             match = re.search(r'(v|i)_p(\d+)_(\d+)_(\d+)_(\d+)_depth_filtered_image\.jpg', rgb_file)
             if not match:
@@ -425,6 +531,12 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
                 scenes[scene_key]['Kd'] = Kd
 
             kept = []  # final objects kept for writing labels
+            boxes = getattr(results[0], "boxes", None) 
+            total_detections = 0 if boxes is None else len(boxes)
+            if not boxes or total_detections == 0:
+                stats['no_detections'] += 1
+                continue
+
             for det_idx, det in enumerate(results[0].boxes):
                 # confidence filter
                 if hasattr(det, 'conf') and float(det.conf.cpu().numpy().reshape(-1)[0]) < conf:
@@ -434,8 +546,13 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
                 x1 = int(round(x1r * scale_x)); x2 = int(round(x2r * scale_x))
                 y1 = int(round(y1r * scale_y)); y2 = int(round(y2r * scale_y))
                 # shrink bbox margins to reduce background
-                bw = max(1, x2 - x1); bh = max(1, y2 - y1)
-                cx = (x1 + x2) * 0.5; cy = (y1 + y2) * 0.5
+                bw = max(1, x2 - x1); bh = max(1, y2 - y1)   # width and height of the bbox on the RGB image
+                cx = (x1 + x2) * 0.5; cy = (y1 + y2) * 0.5   # center of the bbox on the RGB image
+                
+                # ROI filter: only keep bbox centers within valid ROI (exclude image edges)
+                if cx < roi_margin or cx > w - roi_margin or cy < roi_margin or cy > h - roi_margin:
+                    continue
+                
                 shrink = 0.08
                 bw2 = max(6.0, bw * (1.0 - shrink)); bh2 = max(6.0, bh * (1.0 - shrink))
                 x1 = int(round(cx - bw2 * 0.5)); x2 = int(round(cx + bw2 * 0.5))
@@ -443,8 +560,9 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w - 1, x2), min(h - 1, y2)
                 
-                # Fill mask
-                cls_id = det_idx + 1
+                # Fill mask: fill the bbox on the segmentation mask with the class id
+                raw_cls = int(det.cls.cpu().item()) if hasattr(det, 'cls') else 0
+                cls_id = raw_cls + 1   # keep 1..N semantics (0 for background/unlabeled)
                 seg_mask[y1:y2, x1:x2] = cls_id
                 
                 # Extract point cloud (using RGB-D alignment method)
@@ -452,15 +570,14 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
                 pointcloud_raw = depth_to_pointcloud_patch(depth_image, rgb_image, bbox, Kd)
                 
                 if len(pointcloud_raw) < min_points:
+                    stats['low_points'] += 1
                     continue
                 
-                # voxel downsample for pose fitting only (2mm) - keeps fitting stable
-                pointcloud_for_fitting = downsample_points(pointcloud_raw, voxel_size=0.002)
-                
-                # Estimate pose using downsampled point cloud (more stable)
-                pose = estimate_pose_from_pointcloud(pointcloud_for_fitting)
+                # NO pre-downsampling
+                pose = estimate_pose_from_pointcloud(pointcloud_raw, stats=stats)
                 # skip invalid (identity) pose
                 if np.allclose(pose, np.eye(4), atol=1e-4):
+                    stats['identity_pose'] += 1
                     continue
                 poses_list.append(pose)
                 cls_indexes.append(cls_id)
@@ -469,15 +586,27 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
                 conf_val = float(det.conf.cpu().numpy().reshape(-1)[0]) if hasattr(det, 'conf') else 1.0
                 kept.append({'cls_id': cls_id, 'bbox': [x1, y1, x2, y2], 'conf': conf_val})
             
+            # Debug: print why frames are skipped
             if len(poses_list) == 0:
+                if total_detections == 0:
+                    stats['no_detections'] += 1
+                elif len(kept) == 0:
+                    stats['detections_filtered'] += 1
+                else:
+                    stats['fitting_failed'] += 1
                 continue
             
+            stats['success_frames'] += 1
+            
             # Save RGB and depth (ensure depth is uint16 to avoid CV_8U fallback)
+            # Use fast PNG compression for speed
+            png_fast = [cv2.IMWRITE_PNG_COMPRESSION, 1]  # 0-9, 1 is fast with good quality
+            
             rgb_out = os.path.join(scene_path, 'rgb', f"{frame_idx:04d}.png")
             depth_out = os.path.join(scene_path, 'depth', f"{frame_idx:04d}.png")
             label_out = os.path.join(scene_path, 'label', f"{frame_idx:04d}.png")
             
-            cv2.imwrite(rgb_out, rgb_image)
+            cv2.imwrite(rgb_out, rgb_image, png_fast)
             # convert depth to uint16 in millimeters if needed
             d = depth_image
             if d.dtype != np.uint16:
@@ -490,10 +619,10 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
                 depth_to_save = d_mm
             else:
                 depth_to_save = d
-            cv2.imwrite(depth_out, depth_to_save)
-            cv2.imwrite(label_out, seg_mask)
+            cv2.imwrite(depth_out, depth_to_save, png_fast)
+            cv2.imwrite(label_out, seg_mask, png_fast)
             
-            # Save meta (GraspNet format)
+            # Save meta (GraspNet format) without compression for speed
             import scipy.io as sio
             meta = {
                 'cls_indexes': np.array(cls_indexes, dtype=np.int32),
@@ -502,20 +631,22 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
                 'factor_depth': np.float32(1000.0)  # mm to m
             }
             meta_out = os.path.join(scene_path, 'meta', f"{frame_idx:04d}.mat")
-            sio.savemat(meta_out, meta)
+            sio.savemat(meta_out, meta, do_compression=False)
             
-            # Save point clouds for each object (.npy and .ply)
+            # Save point clouds for each object (.npy only - PLY disabled for speed)
+            SAVE_PLY = False  # PLY files not needed for training
             for obj_idx, pointcloud in enumerate(pointclouds_list):
                 pc_out = os.path.join(scene_path, 'pointclouds', f"{frame_idx:04d}_obj{obj_idx}.npy")
                 np.save(pc_out, pointcloud.astype(np.float32))
-                # PLY (ASCII) via Open3D
-                try:
-                    pcd_o3d = o3d.geometry.PointCloud()
-                    pcd_o3d.points = o3d.utility.Vector3dVector(pointcloud.astype(np.float64))
-                    pc_out_ply = os.path.join(scene_path, 'pointclouds', f"{frame_idx:04d}_obj{obj_idx}.ply")
-                    o3d.io.write_point_cloud(pc_out_ply, pcd_o3d, write_ascii=True)
-                except Exception as e:
-                    print(f"   Warning: failed to write PLY for {frame_idx:04d}_obj{obj_idx}: {e}")
+                if SAVE_PLY:
+                    # PLY (binary) via Open3D
+                    try:
+                        pcd_o3d = o3d.geometry.PointCloud()
+                        pcd_o3d.points = o3d.utility.Vector3dVector(pointcloud.astype(np.float64))
+                        pc_out_ply = os.path.join(scene_path, 'pointclouds', f"{frame_idx:04d}_obj{obj_idx}.ply")
+                        o3d.io.write_point_cloud(pc_out_ply, pcd_o3d, write_ascii=False)
+                    except Exception as e:
+                        print(f"   Warning: failed to write PLY for {frame_idx:04d}_obj{obj_idx}: {e}")
             # Save depth-sized xyxy labels with conf for reproducibility
             labels_dir = os.path.join(scene_path, 'labels_xyxy_depth')
             os.makedirs(labels_dir, exist_ok=True)
@@ -542,8 +673,21 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
     print(f"  Output directory: {output_dir}")
     for scene_key, scene_info in scenes.items():
         print(f"  {scene_key}: {scene_info['frames']} frames")
+    
+    # print(f"\nDebug Statistics:")
+    # print(f"  Total frames processed: {stats['total_frames']}")
+    # print(f"  Successful frames: {stats['success_frames']}")
+    # print(f"  Frames with no YOLO detections: {stats['no_detections']}")
+    # print(f"  Frames with detections filtered out: {stats['detections_filtered']}")
+    # print(f"  Frames with cylinder fitting failed: {stats['fitting_failed']}")
+    # print(f"  Detections with low point counts (<{min_points}): {stats['low_points']}")
+    # print(f"  Detections with identity pose: {stats['identity_pose']}")
+    # print(f"\nClustering Statistics:")
+    # print(f"  Top3 clustering success: {stats['top3_success']}")
+    # print(f"  Top2 fallback: {stats['top2_fallback']}")
+    # print(f"  Cluster too few (<2): {stats['cluster_too_few']}")
 
-
+# -----------------------------main function------------------------------
 def main():
     import argparse
     
@@ -559,6 +703,8 @@ def main():
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--device", default=None)
     parser.add_argument("--min_points", type=int, default=100)
+    parser.add_argument("--roi_margin", type=int, default=50, 
+                        help="Pixel margin from image borders to exclude from ROI (default 50)")
     
     args = parser.parse_args()
     
@@ -569,7 +715,8 @@ def main():
         args.conf,
         args.imgsz,
         args.device,
-        args.min_points
+        args.min_points,
+        args.roi_margin
     )
     
     print("\nDone!")
