@@ -8,7 +8,7 @@ python3 rebar_tying/scripts/process_training_data.py \
     --depth_dir rebar_tying/texture_suppression_model/images/rebar_joint_pose_estimation/Nano0711 \
     --output_dir rebar_tying/datasets \
     --yolo_model rebar_tying/texture_suppression_model/runs/pose/train2/weights/best.pt \
-    --conf 0.7 --imgsz 960 --device cuda:0 --min_points 200 --roi_margin 100
+    --conf 0.6 --imgsz 960 --device cuda:0 --min_points 200 --roi_margin 100
     
     Note: 
     - Both RGB and Depth files are searched in depth_dir/Vertical/ or depth_dir/Incline/ subdirectories
@@ -64,7 +64,7 @@ def depth_to_pointcloud_patch(depth_image, rgb_image, bbox, camera_intrinsics, w
         cx = (x1 + x2) // 2
         cy = (y1 + y2) // 2
         half_win = window_size // 2
-        x_min = max(0, cx - half_win)
+        x_min = max(0, cx - half_win) 
         x_max = min(w, cx + half_win)
         y_min = max(0, cy - half_win)
         y_max = min(h, cy + half_win)
@@ -427,9 +427,8 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
         roi_margin: pixel margin from image borders to exclude from ROI (default 50)
                     Only bbox centers within ROI are kept (ignores edge detections)
     """
-    print("="*80)
-    print("Preparing GraspNet-style Training Data")
-    print("="*80)
+    # print("Preparing GraspNet-style Training Data")
+    # print("="*80)
     
     # Load YOLO model
     print(f"\n1. Loading YOLO model: {yolo_model_path}")
@@ -594,12 +593,8 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
                 x1 = int(round(x1r * scale_x)); x2 = int(round(x2r * scale_x))
                 y1 = int(round(y1r * scale_y)); y2 = int(round(y2r * scale_y))
                 # shrink bbox margins to reduce background
-                bw = max(1, x2 - x1); bh = max(1, y2 - y1)   # width and height of the bbox on the RGB image
-                cx = (x1 + x2) * 0.5; cy = (y1 + y2) * 0.5   # center of the bbox on the RGB image
-                
-                # ROI filter: only keep bbox centers within valid ROI (exclude image edges)
-                if cx < roi_margin or cx > w - roi_margin or cy < roi_margin or cy > h - roi_margin:
-                    continue
+                bw = max(1, x2 - x1); bh = max(1, y2 - y1)   # width and height of the bbox
+                cx = (x1 + x2) * 0.5; cy = (y1 + y2) * 0.5   # center of the bbox
                 
                 shrink = 0.08
                 bw2 = max(6.0, bw * (1.0 - shrink)); bh2 = max(6.0, bh * (1.0 - shrink))
@@ -608,6 +603,17 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w - 1, x2), min(h - 1, y2)
                 
+                # ROI filter AFTER shrink: ensure shrunk bbox is fully within safe zone
+                # Check that all four edges are at least roi_margin pixels from image borders
+                if x1 < roi_margin or y1 < roi_margin or x2 > (w - roi_margin) or y2 > (h - roi_margin):
+                    continue
+                
+                # Additional check: ensure 200x200 center window is also fully within ROI
+                half_win = 100  # window_size // 2 from depth_to_pointcloud_patch
+                if (cx - half_win) < roi_margin or (cy - half_win) < roi_margin \
+                   or (cx + half_win) > (w - roi_margin) or (cy + half_win) > (h - roi_margin):
+                    continue
+                
                 # Fill mask: fill the bbox on the segmentation mask with the class id
                 raw_cls = int(det.cls.cpu().item()) if hasattr(det, 'cls') else 0
                 cls_id = raw_cls + 1   # keep 1..N semantics (0 for background/unlabeled)
@@ -615,7 +621,7 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
                 
                 # Extract point cloud (using RGB-D alignment method)
                 bbox = [x1, y1, x2, y2]
-                pointcloud_raw = depth_to_pointcloud_patch(depth_image, rgb_image, bbox, Kd)
+                pointcloud_raw = depth_to_pointcloud_patch(depth_image, rgb_image, bbox, Kd) # mode="center_win"
                 
                 if len(pointcloud_raw) < min_points:
                     stats['low_points'] += 1
