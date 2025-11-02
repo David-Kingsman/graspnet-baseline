@@ -19,14 +19,13 @@ cy = 504.996466076361
 # -----------------------------depth and rgb image path------------------------------
 depth_path = r'/home/zekaijin/graspnet-baseline/rebar_tying/texture_suppression_model/images/rebar_joint_pose_estimation/Nano0711/Vertical/v_p1_45_400_0_depth_image.tiff'
 rgb_path = r'/home/zekaijin/graspnet-baseline/rebar_tying/texture_suppression_model/images/rebar_joint_pose_estimation/Nano0711/Vertical/v_p1_45_400_0_depth_filtered_image.jpg'
-
 # depth_path = r'image\i_p1_69_400_0_depth_image.tiff'
 # rgb_path = r'image\i_p1_69_400_0_depth_filtered_image.jpg'
 
 # -----------------------------read image------------------------------
-depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0
-rgb_raw = cv2.cvtColor(cv2.imread(rgb_path), cv2.COLOR_BGR2RGB)
-rgb_display = rgb_raw.copy()
+depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0 # convert to meters
+rgb_raw = cv2.cvtColor(cv2.imread(rgb_path), cv2.COLOR_BGR2RGB) # convert to RGB format
+rgb_display = rgb_raw.copy() # copy to display
 
 # -----------------------------mouse click to select point------------------------------
 clicked_point = []

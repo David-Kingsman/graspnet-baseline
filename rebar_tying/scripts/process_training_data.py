@@ -18,18 +18,19 @@ python3 rebar_tying/scripts/process_training_data.py \
     - Incline subdirectory: only matches i_* files
 
 """
+
 import os
 import json
 import numpy as np
 import cv2
-from ultralytics import YOLO
+from ultralytics import YOLO  
 from pathlib import Path    
 from tqdm import tqdm
 import re
-from sklearn.decomposition import PCA
-from sklearn.cluster import DBSCAN
-import collections
-import open3d as o3d
+from sklearn.decomposition import PCA   
+from sklearn.cluster import DBSCAN  
+import collections   
+import open3d as o3d  
 
 # Camera intrinsics 
 FX = 1734.7572357650336
@@ -37,7 +38,7 @@ FY = 1734.593101527403
 CX = 632.2360387060742
 CY = 504.996466076361
 
-# Camera intrinsics for rebar_tying dataset
+# Camera intrinsics for rebar_tying dataset 
 CAMERA_INTRINSICS = np.array([
     [FX, 0, CX],
     [0, FY, CY],
@@ -45,34 +46,39 @@ CAMERA_INTRINSICS = np.array([
 ])
 
 # -----------------------------generate local point cloud------------------------------
-def depth_to_pointcloud_patch(depth_image, rgb_image, bbox, camera_intrinsics, window_size=200):
+def depth_to_pointcloud_patch(depth_image, rgb_image, bbox, camera_intrinsics, window_size=200, mode="center_win"):
     """
-    Extract point cloud from depth image within a fixed-size window centered at bbox center.
-    Similar to cylinder_fitting.py's approach of focusing on a 200x200 window around the keypoint.
+    Extract point cloud from depth image.
     
     Args:
         bbox: bounding box [x1, y1, x2, y2]
-        window_size: size of the square window (default 200x200 like cylinder_fitting.py)
+        camera_intrinsics: camera intrinsics matrix
+        window_size: size of the square window when mode="center_win" (default 200x200)
+        mode: "center_win" = 200x200 window around center, "bbox" = use entire bbox
     """
     x1, y1, x2, y2 = [int(coord) for coord in bbox]
     h, w = depth_image.shape[:2]
     
-    # Calculate bbox center (keypoint)
-    cx = (x1 + x2) // 2
-    cy = (y1 + y2) // 2
+    if mode == "center_win" and window_size is not None:
+        # Calculate bbox center (keypoint) and create fixed-size window
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        half_win = window_size // 2
+        x_min = max(0, cx - half_win)
+        x_max = min(w, cx + half_win)
+        y_min = max(0, cy - half_win)
+        y_max = min(h, cy + half_win)
+    else:
+        # Use entire bbox
+        x_min = max(0, x1)
+        x_max = min(w, x2)
+        y_min = max(0, y1)
+        y_max = min(h, y2)
     
-    # Create fixed-size window centered at bbox center (like cylinder_fitting.py's half_win=100)
-    half_win = window_size // 2
-    x_min = max(0, cx - half_win)
-    x_max = min(w, cx + half_win)
-    y_min = max(0, cy - half_win)
-    y_max = min(h, cy + half_win)
-    
-    # crop depth image
-    # note: depth_image should be in millimeters, here convert to meters
+    # crop depth image (in millimeters, convert to meters)
     depth_crop = depth_image[y_min:y_max, x_min:x_max].astype(np.float32) / 1000.0
     
-    # crop RGB image
+    # crop RGB image (if provided) (convert to RGB format)
     if rgb_image is not None:
         hrgb, wrgb = rgb_image.shape[:2]
         if (hrgb != h) or (wrgb != w):
@@ -92,16 +98,22 @@ def depth_to_pointcloud_patch(depth_image, rgb_image, bbox, camera_intrinsics, w
     fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
     cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
     
-    # use meshgrid to generate pixel coordinates (use the window coordinates)
+    # use meshgrid to generate pixel coordinates
     xx, yy = np.meshgrid(np.arange(x_min, x_max), np.arange(y_min, y_max))
     
-    # z is already in meters, directly use
+    # z is already in meters
     z = depth_crop
     x3d = (xx - cx) * z / fx
     y3d = (yy - cy) * z / fy
     
-    # filter valid depth
-    valid = (z > 0) & (z < 0.5) & np.isfinite(z) & np.isfinite(x3d) & np.isfinite(y3d)
+    # Adaptive depth filtering (replace fixed 0.5m threshold)
+    z_valid = np.isfinite(z) & (z > 0) & np.isfinite(x3d) & np.isfinite(y3d)
+    if np.any(z_valid):
+        z_med = np.median(z[z_valid])
+        # Keep points within ±8cm of median (adjust 0.08 to 0.04-0.10 as needed)
+        valid = z_valid & (np.abs(z - z_med) < 0.08)
+    else:
+        valid = z_valid
     
     if not np.any(valid):
         return np.empty((0, 3), dtype=np.float32)
@@ -128,6 +140,9 @@ def fit_cylinder_least_squares(points):
     pca = PCA(n_components=3)
     pca.fit(points)
     axis_dir = pca.components_[0]
+    # Ensure Z component is positive (same as cylinder_fitting.py)
+    if axis_dir[2] < 0:
+        axis_dir = -axis_dir
 
     projections = points @ axis_dir
     h_min, h_max = projections.min(), projections.max()
@@ -150,25 +165,46 @@ def fit_cylinder_least_squares(points):
 
     return axis_point, axis_dir, radius, h_min, h_max
 
+# -----------------------------frame converters (only for visualization)------------------------------
+def pose_cv_to_viz(pose_cv: np.ndarray, mode: str = "open3d") -> np.ndarray:
+    """
+    Convert a pose defined in OpenCV camera frame (x right, y down, z forward)
+    to a visualization frame.
+
+    mode:
+      - "open3d": x right, y up, z forward  -> flip Y
+      - "opengl": x right, y up, z backward -> flip Y and Z
+      - "opencv": no change
+    """
+    T = np.eye(4, dtype=np.float32)
+    if mode == "open3d":
+        T[:3, :3] = np.diag([1, -1, 1]).astype(np.float32)
+    elif mode == "opengl":
+        T[:3, :3] = np.diag([1, -1, -1]).astype(np.float32)
+    else:  # "opencv"
+        return pose_cv.astype(np.float32)
+    return (T @ pose_cv).astype(np.float32)
+
 # -----------------------------canonicalize coordinate system------------------------------
 def canonicalize_axes_opencv(z_axis, x_hint, ref_z=np.array([0.,0.,1.], dtype=np.float32)):
     """
-    Canonicalize local coordinate system to OpenCV camera frame:
-      1) z aligns with ref_z (camera +Z)
+    Canonicalize local coordinate system:
+      1) z aligns with ref_z (typically world up [0,0,1])
       2) x is the orthogonal projection of x_hint onto z's plane
-      3) Right-handed system, with y=z×x also aligned with ref_z
+      3) Right-handed system, with y=z×x
     Input:
-      z_axis: main axis direction (e.g. cyl1_dir)
-      x_hint: secondary axis direction (e.g. cyl2_dir)
+      z_axis: main axis direction (e.g. normal vector)
+      x_hint: secondary axis direction (e.g. main rebar direction for X/Y alignment)
     Returns:
       R: 3x3 rotation matrix (column vectors are x,y,z)
     """
     z = z_axis.astype(np.float32)
     z /= (np.linalg.norm(z) + 1e-9)
 
-    # (1) Force z to align with ref_z
+    # (1) Force z to align with ref_z (typically world up [0,0,1])
     if float(np.dot(z, ref_z)) < 0.0:
         z = -z
+        x_hint = -x_hint  # Preserve relative orientation
 
     # (2) Use x_hint to construct x on z's orthogonal plane
     xh = x_hint.astype(np.float32)
@@ -181,11 +217,15 @@ def canonicalize_axes_opencv(z_axis, x_hint, ref_z=np.array([0.,0.,1.], dtype=np
     # (3) Right-handed coordinate system
     y = np.cross(z, x)
     y /= (np.linalg.norm(y) + 1e-9)
-
-    # Optional: ensure y aligns with ref_z (unique orientation)
-    if float(np.dot(y, ref_z)) < 0.0:
+    x = np.cross(y, z)  # Re-orthogonalize x
+    x /= (np.linalg.norm(x) + 1e-9)
+    
+    # (4) Lock x to be consistent with x_hint's projection
+    # If the projected direction is opposite to x_hint's projection, flip x and rebuild y
+    if np.dot(x, xh - float(np.dot(xh, z)) * z) < 0:
         x = -x
-        y = -y
+        y = np.cross(z, x)
+        y /= (np.linalg.norm(y) + 1e-9)
 
     R = np.stack([x, y, z], axis=1)  # columns are x,y,z
     # Numerical robustness: ensure det>0
@@ -306,8 +346,11 @@ def estimate_pose_from_pointcloud(pointcloud, stats=None):
                                 intersection_point = calculate_line_intersection(
                                     cyl1_point, cyl1_dir, cyl2_point, cyl2_dir
                                 )
-                                # Canonicalize coordinate system: z aligns with camera +Z
-                                R = canonicalize_axes_opencv(z_axis=cyl1_dir, x_hint=cyl2_dir)
+                                # Canonicalize coordinate system: Z = normal to both rebars
+                                normal = np.cross(cyl1_dir, cyl2_dir)
+                                normal = normal / (np.linalg.norm(normal) + 1e-9)
+                                # canonicalize_axes_opencv will handle the upward alignment
+                                R = canonicalize_axes_opencv(z_axis=normal, x_hint=cyl1_dir)
                                 pose_matrix = np.eye(4, dtype=np.float32)
                                 pose_matrix[:3, :3] = R
                                 pose_matrix[:3, 3] = intersection_point.astype(np.float32)
@@ -350,8 +393,13 @@ def estimate_pose_from_pointcloud(pointcloud, stats=None):
             cyl1_point, cyl1_dir, cyl2_point, cyl2_dir
         )
         
-        # 8. canonicalize coordinate system: z aligns with camera +Z
-        R = canonicalize_axes_opencv(z_axis=cyl1_dir, x_hint=cyl2_dir)
+        # 8. canonicalize coordinate system: Z = normal to both rebars
+        # Compute normal as cross product of the two rebar directions
+        normal = np.cross(cyl1_dir, cyl2_dir)
+        normal = normal / (np.linalg.norm(normal) + 1e-9)
+        
+        # canonicalize_axes_opencv will handle the upward alignment
+        R = canonicalize_axes_opencv(z_axis=normal, x_hint=cyl1_dir)
         pose_matrix = np.eye(4, dtype=np.float32)
         pose_matrix[:3, :3] = R
         pose_matrix[:3, 3] = intersection_point.astype(np.float32)
@@ -505,7 +553,7 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
             if rgb_image is None or depth_image is None:
                 continue
             
-            # Run YOLO detection on RGB image
+            # Run YOLO detection on RGB image (for object detection)
             results = model.predict(rgb_path, conf=conf, imgsz=imgsz, device=device, verbose=False)
             
             # Create segmentation mask
@@ -514,7 +562,7 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
             
             poses_list = []
             cls_indexes = []
-            pointclouds_list = []  # Store point clouds for this frame
+            pointclouds_list = []  # store point clouds for this frame
             
             # size matching: YOLO generated bbox on RGB image, need to convert to depth image size
             hrgb, wrgb = rgb_image.shape[:2]
@@ -598,6 +646,12 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
             
             stats['success_frames'] += 1
             
+            # Resize RGB to match depth size if different (CRITICAL for consistent projection)
+            if (hrgb, wrgb) != (h, w):
+                rgb_resized = cv2.resize(rgb_image, (w, h), interpolation=cv2.INTER_LINEAR)
+            else:
+                rgb_resized = rgb_image
+            
             # Save RGB and depth (ensure depth is uint16 to avoid CV_8U fallback)
             # Use fast PNG compression for speed
             png_fast = [cv2.IMWRITE_PNG_COMPRESSION, 1]  # 0-9, 1 is fast with good quality
@@ -606,7 +660,7 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
             depth_out = os.path.join(scene_path, 'depth', f"{frame_idx:04d}.png")
             label_out = os.path.join(scene_path, 'label', f"{frame_idx:04d}.png")
             
-            cv2.imwrite(rgb_out, rgb_image, png_fast)
+            cv2.imwrite(rgb_out, rgb_resized, png_fast)
             # convert depth to uint16 in millimeters if needed
             d = depth_image
             if d.dtype != np.uint16:
@@ -628,7 +682,8 @@ def prepare_scene_data(depth_dir, output_dir, yolo_model_path, conf=0.6, imgsz=6
                 'cls_indexes': np.array(cls_indexes, dtype=np.int32),
                 'poses': np.asarray(poses_list, dtype=np.float32),  # (N,4,4)
                 'intrinsic_matrix': Kd.astype(np.float32),
-                'factor_depth': np.float32(1000.0)  # mm to m
+                'factor_depth': np.float32(1000.0),  # mm to m
+                'image_size_hw': np.array([h, w], dtype=np.int32)  # Save image size for verification
             }
             meta_out = os.path.join(scene_path, 'meta', f"{frame_idx:04d}.mat")
             sio.savemat(meta_out, meta, do_compression=False)
