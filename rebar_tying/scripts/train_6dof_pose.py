@@ -23,10 +23,10 @@ import glob
 import cv2
 import scipy.io as sio
 
-# Add paths following official style
+# Add paths
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.join(ROOT_DIR, 'utils'))
-sys.path.append(os.path.join(ROOT_DIR, 'pointnet2'))
+sys.path.append(os.path.join(ROOT_DIR, 'pointnet2')) # pointnet2 backbone
 sys.path.append(os.path.join(ROOT_DIR, 'models'))
 
 from backbone import Pointnet2Backbone
@@ -47,7 +47,7 @@ parser.add_argument('--bn_decay_step', type=int, default=2, help='Period of BN d
 parser.add_argument('--bn_decay_rate', type=float, default=0.5, help='Decay rate for BN decay [default: 0.5]')
 parser.add_argument('--lr_decay_steps', default='20,35,45', help='When to decay the learning rate (in epochs) [default: 20,35,45]')
 parser.add_argument('--lr_decay_rates', default='0.1,0.1,0.1', help='Decay rates for lr decay [default: 0.1,0.1,0.1]')
-parser.add_argument('--num_workers', type=int, default=0, help='Number of data loading workers [default: 0]')
+parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers [default: 4]')
 
 # Bbox options (当前数据生成已保存局部点云，训练时通常不需要二次裁剪)
 parser.add_argument('--use_bbox', action='store_true', default=False, help='Use bounding box for local point cloud (通常不需要，因为数据生成时已保存局部点云)')
@@ -59,7 +59,7 @@ parser.add_argument('--bbox_debug', action='store_true', help='Print verbose log
 
 # Loss weights (平衡旋转和平移损失)
 parser.add_argument('--w_rot', type=float, default=1.0, help='Weight for rotation loss [default: 1.0]')
-parser.add_argument('--w_trans', type=float, default=1.0, help='Weight for translation loss [default: 1.0]')
+parser.add_argument('--w_trans', type=float, default=10.0, help='Weight for translation loss [default: 10.0] (米级尺度平衡)')
 parser.add_argument('--use_symmetry_loss', action='store_true', default=False, help='Use symmetry-aware rotation loss (处理钢筋交叉结构的对称性)')
 
 cfgs = parser.parse_args()
@@ -411,15 +411,20 @@ class PoseEstimationNet(nn.Module):
         self.backbone = Pointnet2Backbone(input_feature_dim)
         
         # Pose regression head - 使用 LazyLinear 适配不确定的通道数 2*C
+        # 增强正则化以缓解过拟合（Dropout从0.1增加到0.3）
         self.pose_head = nn.Sequential(
             nn.LazyLinear(512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
             nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
             nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(128, 16)
         )
     
@@ -574,8 +579,8 @@ def train_one_epoch():
     
     epoch_start_time = time.time()
     
-    # AMP scaler
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    # AMP scaler (使用新API避免弃用警告)
+    scaler = torch.amp.GradScaler('cuda', enabled=True)
     for batch_idx, batch_data_label in pbar:
         batch_start_time = time.time()
         
@@ -586,7 +591,7 @@ def train_one_epoch():
         optimizer.zero_grad(set_to_none=True)
         # Forward with AMP
         # Disable AMP temporarily to avoid dtype issues in pointnet2 grouping
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             pred_poses = net(pointclouds)
             # Prepare end_points for loss calculation
             end_points = {
@@ -668,6 +673,7 @@ def evaluate_one_epoch():
                 ncols=120,
                 leave=False)
     
+    batch_idx = -1  # Initialize to handle empty test set
     for batch_idx, batch_data_label in pbar:
         # Move data to device
         pointclouds = batch_data_label['pointcloud'].to(device)
@@ -769,9 +775,12 @@ net.to(device)
 
 # 先用 dummy batch materialize LazyLinear 的 in_features（虚拟前向）
 # 这样可以在加载checkpoint时使用strict=True（更严格）
+# 注意：需要在 eval 模式下进行，避免 BatchNorm 在 batch_size=1 时出错
 with torch.no_grad():
+    net.eval()  # 设置为 eval 模式，BatchNorm 可以处理 batch_size=1
     _dummy = torch.zeros(1, cfgs.num_point, 3, device=device, dtype=torch.float32)
     _ = net(_dummy)
+    net.train()  # 恢复训练模式
 
 # Load the Adam optimizer
 optimizer = optim.Adam(net.parameters(), lr=cfgs.learning_rate, weight_decay=cfgs.weight_decay)
@@ -810,15 +819,15 @@ def train(start_epoch):
     # Record training start time
     TRAINING_START_TIME = time.time()
     
-    print(f"\n🚀 开始训练 6DoF Pose Estimation 模型")
-    print(f"📊 训练配置:")
-    print(f"   - 总epoch数: {cfgs.max_epoch}")
-    print(f"   - 批次大小: {cfgs.batch_size}")
-    print(f"   - 学习率: {cfgs.learning_rate}")
-    print(f"   - 数据集: {cfgs.camera}")
-    print(f"   - 使用bbox: {cfgs.use_bbox} (数据生成时已保存局部点云，通常不需要)")
-    print(f"   - 使用YOLO bbox: {cfgs.use_yolo_bbox} (仅当use_bbox=True时有效)")
-    print(f"   - 开始epoch: {start_epoch}")
+    print(f"\n🚀 start training 6DoF Pose Estimation model")
+    print(f"📊 training configuration:")
+    print(f"   - total epochs: {cfgs.max_epoch}")
+    print(f"   - batch size: {cfgs.batch_size}")
+    print(f"   - learning rate: {cfgs.learning_rate}")
+    print(f"   - dataset: {cfgs.camera}")
+    print(f"   - use bbox: {cfgs.use_bbox} (local point cloud is saved, usually not needed)")
+    print(f"   - use YOLO bbox: {cfgs.use_yolo_bbox} (only valid when use_bbox=True)")
+    print(f"   - start epoch: {start_epoch}")
     print("=" * 80)
     
     for epoch in range(start_epoch, cfgs.max_epoch):
@@ -845,10 +854,10 @@ def train(start_epoch):
         log_string('Current BN decay momentum: %f'%(bnm_scheduler.lmbd(bnm_scheduler.last_epoch)))
         log_string(str(datetime.now()))
         
-        print(f"\n📈 Epoch {epoch+1}/{cfgs.max_epoch} - 总体进度: {overall_progress:.1f}%")
-        print(f"⏱️  已用时间: {format_time(elapsed_time)}")
+        print(f"\n📈 Epoch {epoch+1}/{cfgs.max_epoch} - overall progress: {overall_progress:.1f}%")
+        print(f"⏱️  elapsed time: {format_time(elapsed_time)}")
         if estimated_remaining_time > 0:
-            print(f"⏳ 预计剩余: {format_time(estimated_remaining_time)}")
+            print(f"⏳ estimated remaining time: {format_time(estimated_remaining_time)}")
         
         # Reset numpy seed
         # REF: https://github.com/pytorch/pytorch/issues/5059
@@ -858,7 +867,7 @@ def train(start_epoch):
         train_one_epoch()
         
         # Evaluate
-        print(f"\n🔍 开始评估...")
+        print(f"\n🔍 start evaluating...")
         loss = evaluate_one_epoch()
         
         # Save checkpoint
@@ -871,32 +880,32 @@ def train(start_epoch):
         except:
             save_dict['model_state_dict'] = net.state_dict()
         
-        # 保存最新checkpoint
+        # save the latest checkpoint
         ckpt_latest = os.path.join(cfgs.log_dir, 'checkpoint.tar')
         torch.save(save_dict, ckpt_latest)
         
         # Display epoch summary
         epoch_time = EPOCH_TIMES[-1] if EPOCH_TIMES else 0
         print(f"\n✅ Epoch {epoch+1} 完成!")
-        print(f"   - 训练时间: {format_time(epoch_time)}")
-        print(f"   - 验证损失: {loss:.4f}")
-        print(f"   - 最佳损失: {min_loss:.4f}")
+        print(f"   - training time: {format_time(epoch_time)}")
+        print(f"   - validation loss: {loss:.4f}")
+        print(f"   - best loss: {min_loss:.4f}")
         
-        # 保存最佳模型
+        # save the best model
         if loss < min_loss:
             min_loss = loss
             ckpt_best = os.path.join(cfgs.log_dir, 'best_model.tar')
             torch.save(save_dict, ckpt_best)
-            print(f"   🎉 新的最佳损失! 已保存到 {ckpt_best}")
+            print(f"   🎉 new best loss! saved to {ckpt_best}")
         
         print("=" * 80)
     
     # Training completed
     total_time = time.time() - TRAINING_START_TIME
-    print(f"\n🎉 训练完成!")
-    print(f"⏱️  总训练时间: {format_time(total_time)}")
-    print(f"📊 最终损失: {loss:.4f}")
-    print(f"💾 模型已保存到: {cfgs.log_dir}/checkpoint.tar")
+    print(f"\n🎉 training completed!")
+    print(f"⏱️  total training time: {format_time(total_time)}")
+    print(f"📊 final loss: {loss:.4f}")
+    print(f"💾 model saved to: {cfgs.log_dir}/checkpoint.tar")
 
 
 if __name__=='__main__':

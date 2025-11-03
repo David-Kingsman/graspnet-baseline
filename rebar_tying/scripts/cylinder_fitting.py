@@ -22,13 +22,14 @@ rgb_path = r'/home/zekaijin/graspnet-baseline/rebar_tying/texture_suppression_mo
 # depth_path = r'image\i_p1_69_400_0_depth_image.tiff'
 # rgb_path = r'image\i_p1_69_400_0_depth_filtered_image.jpg'
 
-# -----------------------------read image------------------------------
+# -------------------------------read image and mouse click to select point------------------------------
 depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0 # convert to meters
 rgb_raw = cv2.cvtColor(cv2.imread(rgb_path), cv2.COLOR_BGR2RGB) # convert to RGB format
-rgb_display = rgb_raw.copy() # copy to display
+rgb_display = rgb_raw.copy() # copy to display with mouse click
 
 # -----------------------------mouse click to select point------------------------------
 clicked_point = []
+# mouse callback function to select point
 def mouse_callback(event, x, y, flags, param):
     '''mouse callback function'''
     if event == cv2.EVENT_LBUTTONDOWN:
@@ -37,6 +38,7 @@ def mouse_callback(event, x, y, flags, param):
         print(f"Clicked point: ({x},{y})")
         cv2.destroyAllWindows()
 
+# show image with mouse click
 cv2.imshow("Click on RGB Image", rgb_display)
 cv2.setMouseCallback("Click on RGB Image", mouse_callback)
 cv2.waitKey(0)
@@ -51,15 +53,22 @@ half_win = 100
 x_min, x_max = max(x - half_win, 0), min(x + half_win, w)
 y_min, y_max = max(y - half_win, 0), min(y + half_win, h)
 
+# crop the image around the clicked point
 depth_crop = depth_raw[y_min:y_max, x_min:x_max]
 rgb_crop = rgb_raw[y_min:y_max, x_min:x_max]
 
+# generate meshgrid
 xx, yy = np.meshgrid(np.arange(x_min, x_max), np.arange(y_min, y_max))
+
+# calculate z
 z = depth_crop
 x3d = (xx - cx) * z / fx
 y3d = (yy - cy) * z / fy
 
+# filter out invalid points
 valid = (z > 0) & (z < 0.5)
+
+# stack x, y, z to form point cloud
 xyz = np.stack((x3d[valid], y3d[valid], z[valid]), axis=-1)
 colors = rgb_crop.reshape(-1, 3)[valid.flatten()] / 255.0
 
@@ -112,15 +121,15 @@ pts_class_1 = points[labels == top3_labels[0]]
 pts_class_2_1 = points[labels == top3_labels[1]]
 pts_class_2_2 = points[labels == top3_labels[2]]
 
-# -----------------------------downsampling------------------------------
+# -----------------------------downsampling the two rebar clusters------------------------------
 pts_class_1_ds = downsample_points(pts_class_1, voxel_size=0.001)
 pts_class_2_1_ds = downsample_points(pts_class_2_1, voxel_size=0.001)
 pts_class_2_2_ds = downsample_points(pts_class_2_2, voxel_size=0.001)
 
-# -----------------------------merge the two rebar clusters------------------------------
+# -----------------------------merge the two rebar clusters into one cluster------------------------------
 pts_class_2_ds = np.vstack((pts_class_2_1_ds, pts_class_2_2_ds))
 
-# -----------------------------cylinder fitting function (least squares)------------------------------
+# -----------------------------cylinder fitting function (least squares) for the two rebar clusters------------------------------
 def fit_cylinder_least_squares(points):
     pca = PCA(n_components=3)
     pca.fit(points)
@@ -149,7 +158,7 @@ def fit_cylinder_least_squares(points):
 
     return axis_point, axis_dir, radius, h_min, h_max
 
-# -----------------------------create cylinder mesh------------------------------
+# -----------------------------create cylinder mesh for the two rebar clusters------------------------------
 def create_cylinder_mesh(axis_point, axis_dir, radius, h_min, h_max, extend_len=0, color=[1, 0, 0]):
     '''create cylinder mesh'''
     # extend height: extend extend_len at both ends
@@ -193,7 +202,7 @@ def create_cylinder_mesh(axis_point, axis_dir, radius, h_min, h_max, extend_len=
 
     return mesh_cyl, axis_line
 
-# -----------------------------fit and generate mesh------------------------------
+# -----------------------------fit and generate mesh for the two rebar clusters------------------------------
 cyl1_point, cyl1_dir, cyl1_radius, cyl1_hmin, cyl1_hmax = fit_cylinder_least_squares(pts_class_1_ds)
 print(cyl1_point, cyl1_dir, cyl1_radius)
 cyl2_point, cyl2_dir, cyl2_radius, cyl2_hmin, cyl2_hmax = fit_cylinder_least_squares(pts_class_2_ds)
@@ -230,17 +239,17 @@ pcd_2_2_vis.paint_uniform_color([0.5, 0.5, 0.5])
 # o3d.visualization.draw_geometries([pcd_1_vis, pcd_2_1_vis, pcd_2_2_vis, cyl1_mesh, cyl2_mesh, cyl1_axis, cyl2_axis],
 #                                   window_name="Cylinder Fit Result")
 
-# -----------------------------visualize point cloud + fit cylinder------------------------------
+# -----------------------------visualize point cloud + fit cylinders for the two rebar clusters------------------------------
 o3d.visualization.draw_geometries([pcd.paint_uniform_color([0.5, 0.5, 0.5]), cyl1_mesh, cyl2_mesh, cyl1_axis, cyl2_axis],
                                   window_name="Cylinder Fit Result")
 
 
-# -----------------------------convert cylinder to point cloud and merge------------------------------
+# -----------------------------convert cylinders to point clouds and merge------------------------------
 print("Converting cylinders to point clouds and merging...")
 def mesh_to_pointcloud(mesh, num_points=3000):
     return mesh.sample_points_uniformly(number_of_points=num_points)
 
-# 1. convert cylinder to point cloud and merge
+# 1. convert cylinders to point clouds and merge
 cyl1_pcd = mesh_to_pointcloud(cyl1_mesh, num_points=3000)
 cyl2_pcd = mesh_to_pointcloud(cyl2_mesh, num_points=3000)
 cyl_combined_pcd = cyl1_pcd + cyl2_pcd
